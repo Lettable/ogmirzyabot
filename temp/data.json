@@ -1,0 +1,17 @@
+{
+    "hash": "im34nh00000000000000000000000000",
+    "clients": ["mirza", "mirza2", "mirza3"],
+    "data": {
+        "type": "public",
+        "uniformDelay": "5, 20",
+        "timestamp": "2025-10-15T09:26:04.853Z",
+        "username": "FallenProjects",
+        "messageIds": ["147", "146", "145"],
+        "options": ["2:c", "3:c"],
+        "amount": 5,
+        "info": {
+            "ip": "100.100.100.1"
+        }
+    },
+    "formats": ["ss", "ff", "gg"]
+}
