@@ -2218,14 +2218,15 @@ async def handleVCJoin(msg):
 
         try:
             if is_call_link:
-                # For call links, use InputGroupCallSlug + invite_hash
-                # Telethon's get_entity can't parse t.me/call/ links, so we
-                # monkey-patch the PyTgCalls bridge to return InputGroupCallSlug
+                # For call links, use raw Telethon API with invite_hash
+                # (PyTgCalls v2.3.3 passes public_key which conflicts with slug joins)
                 log(f"VC: #{idx} ({name}) joining call {call_id} for {user}")
                 calls = PyTgCalls(client)
                 await calls.start()
 
                 dummy_id = int.from_bytes(hashlib.md5(call_id.encode()).digest()[:7], 'big')
+
+                # Patch get_input_call to return InputGroupCallSlug
                 original_get_input = calls._app._bind_client.get_input_call
 
                 async def _patched_get_input(chat_id, invite_msg_id=None):
@@ -2234,6 +2235,15 @@ async def handleVCJoin(msg):
                     return await original_get_input(chat_id, invite_msg_id)
 
                 calls._app._bind_client.get_input_call = _patched_get_input
+
+                # Patch join_group_call to strip public_key/block
+                # (v2.3.3 passes these even for non-conference calls)
+                original_join_group = calls._app._bind_client.join_group_call
+
+                async def _patched_join_group(chat_id, json_join, video_stopped, join_as, invite_hash=None, *args, **kwargs):
+                    return await original_join_group(chat_id, json_join, video_stopped, join_as, invite_hash)
+
+                calls._app._bind_client.join_group_call = _patched_join_group
 
                 config = GroupCallConfig(invite_hash=call_id, auto_start=False)
                 await calls.play(dummy_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH), config=config)
