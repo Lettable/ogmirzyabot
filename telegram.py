@@ -4,6 +4,7 @@ import json
 import os
 import re
 import random
+import struct
 import base64
 import hashlib
 import tempfile
@@ -2218,32 +2219,37 @@ async def handleVCJoin(msg):
 
         try:
             if is_call_link:
-                # t.me/call/ links: resolve via invite_hash with raw Telethon.
-                # InputGroupCallSlug triggers conference/E2E mode (needs public_key),
-                # but invite_hash bypasses that for regular voice chat invites.
+                # t.me/call/ links: decode slug to extract real InputGroupCall,
+                # join via invite_hash using raw Telethon (bypass v2.3.3 public_key)
                 log(f"VC: #{idx} ({name}) joining call {call_id} for {user}")
                 calls = PyTgCalls(client)
                 await calls.start()
 
                 dummy_id = int.from_bytes(hashlib.md5(call_id.encode()).digest()[:7], 'big')
 
-                # Patch get_input_call to return a dummy InputGroupCall
-                # (server resolves the real call via invite_hash)
+                # Decode call link slug to get real InputGroupCall(id, access_hash)
+                raw = base64.urlsafe_b64decode(call_id + '==')
+                real_call = InputGroupCall(
+                    id=struct.unpack('<q', raw[0:8])[0],
+                    access_hash=struct.unpack('<q', raw[8:16])[0],
+                )
+
+                # Patch get_input_call to return the real InputGroupCall
                 original_get_input = calls._app._bind_client.get_input_call
 
                 async def _patched_get_input(chat_id, invite_msg_id=None):
                     if chat_id == dummy_id:
-                        return InputGroupCall(id=0, access_hash=0)
+                        return real_call
                     return await original_get_input(chat_id, invite_msg_id)
 
                 calls._app._bind_client.get_input_call = _patched_get_input
 
-                # Replace join_group_call: send via raw Telethon WITHOUT public_key/block
+                # Replace join_group_call: send via raw Telethon, invite_hash authorizes
                 original_join_group = calls._app._bind_client.join_group_call
 
                 async def _patched_join_group(chat_id, json_join, video_stopped, join_as, invite_hash=None, *args, **kwargs):
                     inp = await calls._app._bind_client.get_input_call(chat_id, None)
-                    if isinstance(inp, InputGroupCall) and inp.id == 0 and inp.access_hash == 0:
+                    if chat_id == dummy_id:
                         result = await client(functions.phone.JoinGroupCallRequest(
                             call=inp,
                             join_as=join_as,
@@ -2265,6 +2271,11 @@ async def handleVCJoin(msg):
                     return await original_join_group(chat_id, json_join, video_stopped, join_as, invite_hash, *args, **kwargs)
 
                 calls._app._bind_client.join_group_call = _patched_join_group
+
+                config = GroupCallConfig(invite_hash=call_id, auto_start=False)
+                await calls.play(dummy_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH), config=config)
+                peer_id = dummy_id
+            else:
 
                 config = GroupCallConfig(invite_hash=call_id, auto_start=False)
                 await calls.play(dummy_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH), config=config)
