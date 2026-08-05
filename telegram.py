@@ -2218,38 +2218,39 @@ async def handleVCJoin(msg):
 
         try:
             if is_call_link:
-                # For call links, use raw Telethon API with invite_hash
-                # (PyTgCalls v2.3.3 generates public_key/block internally
-                #  in join_group_call, which conflicts with slug joins)
+                # t.me/call/ links: resolve via invite_hash with raw Telethon.
+                # InputGroupCallSlug triggers conference/E2E mode (needs public_key),
+                # but invite_hash bypasses that for regular voice chat invites.
                 log(f"VC: #{idx} ({name}) joining call {call_id} for {user}")
                 calls = PyTgCalls(client)
                 await calls.start()
 
                 dummy_id = int.from_bytes(hashlib.md5(call_id.encode()).digest()[:7], 'big')
 
-                # Patch get_input_call to return InputGroupCallSlug
+                # Patch get_input_call to return a dummy InputGroupCall
+                # (server resolves the real call via invite_hash)
                 original_get_input = calls._app._bind_client.get_input_call
 
                 async def _patched_get_input(chat_id, invite_msg_id=None):
                     if chat_id == dummy_id:
-                        return InputGroupCallSlug(slug=call_id)
+                        return InputGroupCall(id=0, access_hash=0)
                     return await original_get_input(chat_id, invite_msg_id)
 
                 calls._app._bind_client.get_input_call = _patched_get_input
 
-                # Replace join_group_call to use raw Telethon (no public_key/block)
+                # Replace join_group_call: send via raw Telethon WITHOUT public_key/block
                 original_join_group = calls._app._bind_client.join_group_call
 
                 async def _patched_join_group(chat_id, json_join, video_stopped, join_as, invite_hash=None, *args, **kwargs):
                     inp = await calls._app._bind_client.get_input_call(chat_id, None)
-                    if isinstance(inp, InputGroupCallSlug):
+                    if isinstance(inp, InputGroupCall) and inp.id == 0 and inp.access_hash == 0:
                         result = await client(functions.phone.JoinGroupCallRequest(
                             call=inp,
                             join_as=join_as,
                             params=DataJSON(data=json_join),
                             muted=False,
                             video_stopped=video_stopped,
-                            invite_hash=invite_hash,
+                            invite_hash=call_id,
                         ))
                         data = None
                         for u in result.updates:
