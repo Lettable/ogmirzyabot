@@ -70,7 +70,7 @@ from telethon.tl.types import (
     InputReportReasonIllegalDrugs, InputReportReasonOther,
     InputReportReasonPersonalDetails, InputReportReasonGeoIrrelevant,
     ReportResultReported, ReportResultAddComment,
-    InputGroupCallSlug,
+    InputGroupCallSlug, InputGroupCall, GroupCall, UpdateGroupCallConnection, DataJSON,
 )
 from telethon.errors import (
     UserAlreadyParticipantError, ChatIdInvalidError,
@@ -2243,12 +2243,10 @@ async def handleVCJoin(msg):
                 async def _patched_join_group(chat_id, json_join, video_stopped, join_as, invite_hash=None, *args, **kwargs):
                     inp = await calls._app._bind_client.get_input_call(chat_id, None)
                     if isinstance(inp, InputGroupCallSlug):
-                        from telethon.tl.types import GroupCall, UpdateGroupCallConnection
-                        from telethon.tl.types import InputGroupCall as IGC
-                        result = await client(telethon.tl.functions.phone.JoinGroupCallRequest(
+                        result = await client(functions.phone.JoinGroupCallRequest(
                             call=inp,
                             join_as=join_as,
-                            params=telethon.tl.types.DataJSON(data=json_join),
+                            params=DataJSON(data=json_join),
                             muted=False,
                             video_stopped=video_stopped,
                             invite_hash=invite_hash,
@@ -2259,7 +2257,7 @@ async def handleVCJoin(msg):
                                 data = u.params.data
                             elif hasattr(u, 'call') and isinstance(u.call, GroupCall):
                                 calls._app._bind_client._cache.set_cache(
-                                    chat_id, IGC(id=u.call.id, access_hash=u.call.access_hash))
+                                    chat_id, InputGroupCall(id=u.call.id, access_hash=u.call.access_hash))
                         if data:
                             return data
                         return json.dumps({'transport': None})
