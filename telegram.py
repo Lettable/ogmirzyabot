@@ -2256,14 +2256,13 @@ async def handleVCJoin(msg):
                 async def _patched_join_group(chat_id, json_join, video_stopped, join_as, invite_hash=None, *args, **kwargs):
                     if chat_id == dummy_id:
                         inp = await calls._app._bind_client.get_input_call(chat_id, None)
-                        log(f"VC: #{idx} ({name}) sending JoinGroupCallRequest invite_hash={call_id}")
+                        log(f"VC: #{idx} ({name}) sending JoinGroupCallRequest")
                         result = await client(functions.phone.JoinGroupCallRequest(
                             call=inp,
                             join_as=join_as,
                             params=DataJSON(data=json_join),
                             muted=False,
                             video_stopped=video_stopped,
-                            invite_hash=call_id,
                         ))
                         data = None
                         for u in result.updates:
@@ -2282,7 +2281,7 @@ async def handleVCJoin(msg):
 
                 calls._app._bind_client.join_group_call = _patched_join_group
 
-                config = GroupCallConfig(invite_hash=call_id, auto_start=False)
+                config = GroupCallConfig(auto_start=False)
                 await calls.play(dummy_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH), config=config)
                 peer_id = dummy_id
             else:
