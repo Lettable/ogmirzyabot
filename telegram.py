@@ -2113,7 +2113,8 @@ async def _resolve_call_peer(client, call_id):
 
 
 async def handleVCResolve(msg):
-    """Resolve each selected client to the given chat entity and report back."""
+    """Resolve each selected client to the given chat entity and report back.
+    For call links, they are treated as ready immediately (no resolution needed)."""
     requested_ids = msg.get("clients", [])
     chat          = (msg.get("chat") or "").strip()
 
@@ -2123,17 +2124,6 @@ async def handleVCResolve(msg):
     # Try to parse as call link first
     call_id = _parse_call_link(chat)
 
-    if call_id:
-        # It's a call link
-        chat_ref = f"https://t.me/call/{call_id}"
-    else:
-        # Try as chat ID or username
-        chat_ref = chat.lstrip("@")
-        try:
-            chat_ref = int(chat_ref)
-        except ValueError:
-            pass
-
     results = []
     for ref in requested_ids:
         doc = id_to_doc.get(ref)
@@ -2141,14 +2131,26 @@ async def handleVCResolve(msg):
             continue
         idx    = doc["index"]
         name   = doc.get("name", f"#{idx}")
-        client = activeSessions[idx]
-        try:
-            entity = await client.get_input_entity(chat_ref)
-            full   = await client.get_entity(entity)
-            title  = getattr(full, "title", None) or getattr(full, "username", None) or str(chat_ref)
-            results.append({"index": idx, "ref": ref, "name": name, "ok": True, "title": title})
-        except Exception as e:
-            results.append({"index": idx, "ref": ref, "name": name, "ok": False, "error": repr(e) or str(e)})
+
+        if call_id:
+            # Call links don't need resolution - they're ready immediately
+            results.append({"index": idx, "ref": ref, "name": name, "ok": True, "title": f"Call {call_id[:8]}..."})
+        else:
+            # Resolve chat ID or username
+            client = activeSessions[idx]
+            chat_ref = chat.lstrip("@")
+            try:
+                chat_ref = int(chat_ref)
+            except ValueError:
+                pass
+
+            try:
+                entity = await client.get_input_entity(chat_ref)
+                full   = await client.get_entity(entity)
+                title  = getattr(full, "title", None) or getattr(full, "username", None) or str(chat_ref)
+                results.append({"index": idx, "ref": ref, "name": name, "ok": True, "title": title})
+            except Exception as e:
+                results.append({"index": idx, "ref": ref, "name": name, "ok": False, "error": repr(e) or str(e)})
 
     await _send_user(msg.get("fromUser"), {"type": "vcResolved", "results": results})
 
@@ -2174,11 +2176,9 @@ async def handleVCJoin(msg):
 
     # Try to parse as call link first
     call_id = _parse_call_link(chat)
+    is_call_link = bool(call_id)
 
-    if call_id:
-        # It's a call link
-        chat_ref = f"https://t.me/call/{call_id}"
-    else:
+    if not is_call_link:
         # Try as chat ID or username
         chat_ref = chat.lstrip("@")
         try:
@@ -2216,14 +2216,25 @@ async def handleVCJoin(msg):
             continue
 
         try:
-            log(f"VC: #{idx} ({name}) resolving peer {chat_ref!r} for {user}")
-            entity  = await client.get_entity(chat_ref)
-            peer_id = get_peer_id(entity)
+            if is_call_link:
+                # For call links, join directly without resolving peer
+                log(f"VC: #{idx} ({name}) joining call {call_id} for {user}")
+                calls = PyTgCalls(client)
+                await calls.start()
+                # Try to join the call directly using the call link
+                peer_id = f"https://t.me/call/{call_id}"
+                await calls.play(peer_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH))
+            else:
+                # For chat ID/username, resolve peer first
+                log(f"VC: #{idx} ({name}) resolving peer {chat_ref!r} for {user}")
+                entity  = await client.get_entity(chat_ref)
+                peer_id = get_peer_id(entity)
 
-            calls = PyTgCalls(client)
-            await calls.start()
-            # External raw-PCM audio source (we push the user's mic frames ourselves).
-            await calls.play(peer_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH))
+                calls = PyTgCalls(client)
+                await calls.start()
+                # External raw-PCM audio source (we push the user's mic frames ourselves).
+                await calls.play(peer_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH))
+
             try:
                 await calls.mute(peer_id)   # joins MUTED on Telegram's end too
             except Exception as me:
