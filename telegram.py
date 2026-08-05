@@ -2219,19 +2219,23 @@ async def handleVCJoin(msg):
 
         try:
             if is_call_link:
-                # t.me/call/ links: decode slug to extract real InputGroupCall,
-                # join via invite_hash using raw Telethon (bypass v2.3.3 public_key)
-                log(f"VC: #{idx} ({name}) joining call {call_id} for {user}")
+                # t.me/call/ links: resolve slug via GetGroupCallRequest to get
+                # the real InputGroupCall, then join via invite_hash with raw Telethon
+                log(f"VC: #{idx} ({name}) resolving call link {call_id} for {user}")
                 calls = PyTgCalls(client)
                 await calls.start()
 
                 dummy_id = int.from_bytes(hashlib.md5(call_id.encode()).digest()[:7], 'big')
 
-                # Decode call link slug to get real InputGroupCall(id, access_hash)
-                raw = base64.urlsafe_b64decode(call_id + '==')
+                # Resolve slug to real InputGroupCall using GetGroupCallRequest
+                log(f"VC: #{idx} ({name}) fetching call info for {call_id}")
+                gc_result = await client(functions.phone.GetGroupCallRequest(
+                    call=InputGroupCallSlug(slug=call_id),
+                    limit=1,
+                ))
                 real_call = InputGroupCall(
-                    id=struct.unpack('<q', raw[0:8])[0],
-                    access_hash=struct.unpack('<q', raw[8:16])[0],
+                    id=gc_result.call.id,
+                    access_hash=gc_result.call.access_hash,
                 )
 
                 # Patch get_input_call to return the real InputGroupCall
@@ -2244,12 +2248,12 @@ async def handleVCJoin(msg):
 
                 calls._app._bind_client.get_input_call = _patched_get_input
 
-                # Replace join_group_call: send via raw Telethon, invite_hash authorizes
+                # Replace join_group_call: send via raw Telethon, no public_key/block
                 original_join_group = calls._app._bind_client.join_group_call
 
                 async def _patched_join_group(chat_id, json_join, video_stopped, join_as, invite_hash=None, *args, **kwargs):
-                    inp = await calls._app._bind_client.get_input_call(chat_id, None)
                     if chat_id == dummy_id:
+                        inp = await calls._app._bind_client.get_input_call(chat_id, None)
                         result = await client(functions.phone.JoinGroupCallRequest(
                             call=inp,
                             join_as=join_as,
