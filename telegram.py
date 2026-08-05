@@ -2219,7 +2219,8 @@ async def handleVCJoin(msg):
         try:
             if is_call_link:
                 # For call links, use raw Telethon API with invite_hash
-                # (PyTgCalls v2.3.3 passes public_key which conflicts with slug joins)
+                # (PyTgCalls v2.3.3 generates public_key/block internally
+                #  in join_group_call, which conflicts with slug joins)
                 log(f"VC: #{idx} ({name}) joining call {call_id} for {user}")
                 calls = PyTgCalls(client)
                 await calls.start()
@@ -2236,12 +2237,33 @@ async def handleVCJoin(msg):
 
                 calls._app._bind_client.get_input_call = _patched_get_input
 
-                # Patch join_group_call to strip public_key/block
-                # (v2.3.3 passes these even for non-conference calls)
+                # Replace join_group_call to use raw Telethon (no public_key/block)
                 original_join_group = calls._app._bind_client.join_group_call
 
                 async def _patched_join_group(chat_id, json_join, video_stopped, join_as, invite_hash=None, *args, **kwargs):
-                    return await original_join_group(chat_id, json_join, video_stopped, join_as, invite_hash)
+                    inp = await calls._app._bind_client.get_input_call(chat_id, None)
+                    if isinstance(inp, InputGroupCallSlug):
+                        from telethon.tl.types import GroupCall, UpdateGroupCallConnection
+                        from telethon.tl.types import InputGroupCall as IGC
+                        result = await client(telethon.tl.functions.phone.JoinGroupCallRequest(
+                            call=inp,
+                            join_as=join_as,
+                            params=telethon.tl.types.DataJSON(data=json_join),
+                            muted=False,
+                            video_stopped=video_stopped,
+                            invite_hash=invite_hash,
+                        ))
+                        data = None
+                        for u in result.updates:
+                            if isinstance(u, UpdateGroupCallConnection):
+                                data = u.params.data
+                            elif hasattr(u, 'call') and isinstance(u.call, GroupCall):
+                                calls._app._bind_client._cache.set_cache(
+                                    chat_id, IGC(id=u.call.id, access_hash=u.call.access_hash))
+                        if data:
+                            return data
+                        return json.dumps({'transport': None})
+                    return await original_join_group(chat_id, json_join, video_stopped, join_as, invite_hash, *args, **kwargs)
 
                 calls._app._bind_client.join_group_call = _patched_join_group
 
