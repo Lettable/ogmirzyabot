@@ -2276,11 +2276,6 @@ async def handleVCJoin(msg):
                 await calls.play(dummy_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH), config=config)
                 peer_id = dummy_id
             else:
-
-                config = GroupCallConfig(invite_hash=call_id, auto_start=False)
-                await calls.play(dummy_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH), config=config)
-                peer_id = dummy_id
-            else:
                 # For chat ID/username, resolve peer first
                 log(f"VC: #{idx} ({name}) resolving peer {chat_ref!r} for {user}")
                 entity  = await client.get_entity(chat_ref)
