@@ -2101,14 +2101,47 @@ def _parse_call_link(link):
     return m.group(1) if m else None
 
 
-async def _resolve_call_peer(client, call_id):
-    """Resolve a call link to its peer. Tries to find the group/channel that has this call."""
+async def _get_peer_from_call_link(client, call_id):
+    """Resolve a call link to its peer by decoding the call ID and using phone.GetGroupCall."""
     try:
-        # Try to join the call link directly using get_entity
-        full_link = f"https://t.me/call/{call_id}"
-        entity = await client.get_entity(full_link)
-        return entity
-    except Exception:
+        import base64
+        from telethon.tl.types import InputGroupCall
+        from telethon.tl.functions.phone import GetGroupCallRequest
+
+        # Decode the call ID from base64url to get ID and access_hash
+        # Add padding if needed
+        padded = call_id + "=" * (4 - len(call_id) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode(padded)
+        except Exception:
+            return None
+
+        # The decoded data should contain call ID and access_hash
+        # Try to extract them - first 8 bytes might be ID, next 8 might be access_hash
+        if len(decoded) >= 16:
+            call_id_int = int.from_bytes(decoded[:8], 'little', signed=False)
+            access_hash = int.from_bytes(decoded[8:16], 'little', signed=False)
+        else:
+            return None
+
+        # Try to get the group call info
+        input_call = InputGroupCall(id=call_id_int, access_hash=access_hash)
+        result = await client(GetGroupCallRequest(call=input_call))
+
+        # The result should contain info about the group call
+        # We need to extract the chat ID from it
+        if hasattr(result, 'call') and hasattr(result.call, 'id'):
+            # Try to get more info about this call to find its peer
+            # For now, try to parse participants or other fields
+            if hasattr(result, 'participants'):
+                # There might be peer info in participants
+                for p in result.participants:
+                    if hasattr(p, 'peer'):
+                        return get_peer_id(p.peer)
+
+        return None
+    except Exception as e:
+        log(f"Failed to resolve call link {call_id}: {e}")
         return None
 
 
@@ -2217,23 +2250,21 @@ async def handleVCJoin(msg):
 
         try:
             if is_call_link:
-                # For call links, join directly without resolving peer
-                log(f"VC: #{idx} ({name}) joining call {call_id} for {user}")
-                calls = PyTgCalls(client)
-                await calls.start()
-                # Try to join the call directly using the call link
-                peer_id = f"https://t.me/call/{call_id}"
-                await calls.play(peer_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH))
+                # For call links, decode and get the peer
+                log(f"VC: #{idx} ({name}) resolving call link {call_id} for {user}")
+                peer_id = await _get_peer_from_call_link(client, call_id)
+                if peer_id is None:
+                    raise ValueError(f"Could not resolve call link {call_id} to a peer")
             else:
                 # For chat ID/username, resolve peer first
                 log(f"VC: #{idx} ({name}) resolving peer {chat_ref!r} for {user}")
                 entity  = await client.get_entity(chat_ref)
                 peer_id = get_peer_id(entity)
 
-                calls = PyTgCalls(client)
-                await calls.start()
-                # External raw-PCM audio source (we push the user's mic frames ourselves).
-                await calls.play(peer_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH))
+            calls = PyTgCalls(client)
+            await calls.start()
+            # External raw-PCM audio source (we push the user's mic frames ourselves).
+            await calls.play(peer_id, MediaStream(ExternalMedia.AUDIO, audio_parameters=AudioQuality.HIGH))
 
             try:
                 await calls.mute(peer_id)   # joins MUTED on Telegram's end too
