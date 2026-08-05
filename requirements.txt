@@ -1,0 +1,11 @@
+# 1.43+ is on layer 220+ which includes phone.SendGroupCallMessage (VC raid).
+# NOTE: do NOT switch to Pyrogram/PyroFork — stored sessions are Telethon
+# StringSessions and the formats are incompatible (would invalidate every account).
+telethon>=1.43.0
+pymongo>=4.0.0
+python-dotenv>=1.0.0
+websockets>=12.0
+numpy>=1.24.0
+scipy>=1.10.0
+names>=0.3.0
+py-tgcalls>=2.0.0
