@@ -1867,12 +1867,23 @@ class VCProcessor:
         self.sharp_zi = np.zeros(2, dtype=np.float32)      # presence peak biquad state
         self.air_zi   = np.zeros(2, dtype=np.float32)      # high "air" shelf biquad state
         self.lim_g    = 1.0                                # brick-wall limiter gain (smoothed)
-        # 3-band multiband-compressor ("Crush") crossovers, designed once
+        # 3-band multiband-compressor ("Crush") crossovers — LR4 (cascade 2× 2nd-order Butterworth)
         if SCIPY_OK:
-            self.mb_lp_b, self.mb_lp_a = butter(2, 280.0 / (SR / 2), "low")    # low band
-            self.mb_hp_b, self.mb_hp_a = butter(2, 2800.0 / (SR / 2), "high")  # high band
-            self.mb_lo_zi = np.zeros(2, dtype=np.float32)
-            self.mb_hi_zi = np.zeros(2, dtype=np.float32)
+            _lb, _la = butter(2, 280.0  / (SR / 2), "low")
+            self.mb_lp_b, self.mb_lp_a = _lb, _la
+            self.mb_lp_zi1 = np.zeros(2, dtype=np.float32)
+            self.mb_lp_zi2 = np.zeros(2, dtype=np.float32)
+            _hb, _ha = butter(2, 2800.0 / (SR / 2), "high")
+            self.mb_hp_b, self.mb_hp_a = _hb, _ha
+            self.mb_hi_zi1 = np.zeros(2, dtype=np.float32)
+            self.mb_hi_zi2 = np.zeros(2, dtype=np.float32)
+            # Input HPF at 75 Hz (LR4) — kills sub-bass that wastes WebRTC mixer headroom
+            self.hpf_b, self.hpf_a = butter(2, 75.0 / (SR / 2), "high")
+            self.hpf_zi1 = np.zeros(2, dtype=np.float32)
+            self.hpf_zi2 = np.zeros(2, dtype=np.float32)
+            # Mud cut: narrow -3 dB dip at 320 Hz clears low-mid boxiness
+            self.mud_b, self.mud_a = _peak_coeffs(-3.0, 320.0, Q=0.8)
+            self.mud_zi = np.zeros(2, dtype=np.float32)
             # Denoise low-cut: gentle 2nd-order @90 Hz — trims hum/rumble without
             # thinning the voice (steeper filtering made it sound hollow).
             self.dn_hp_b, self.dn_hp_a = butter(2, 90.0 / (SR / 2), "high")
@@ -1883,6 +1894,11 @@ class VCProcessor:
         self._last_g     = 1.0     # gate gain actually applied last frame (for click-free ramp)
         self.gate_open   = True    # gate state-machine (hysteresis prevents chatter)
         self.gate_hold   = 0       # frames left to hold the gate open through a dip
+        # real envelope compressor state
+        self.comp_env    = 0.0
+        # speech-level rider: keeps voice at ~-18 dBFS before the limiter
+        self.rider_env   = 0.0
+        self.rider_g     = 1.0
         # look-ahead limiter — 5-frame (50 ms) buffer for transient prediction
         import collections as _col
         self._la_buf    = _col.deque(maxlen=5)
@@ -1892,6 +1908,9 @@ class VCProcessor:
         self._comb_bufs    = [np.zeros(d, dtype=np.float32) for d in self._comb_delays]
         self._comb_heads   = [0] * 4
         self._comb_damp_s  = [0.0] * 4
+        self._comb_fbs     = [0.59, 0.56, 0.53, 0.51]   # per-comb feedback → T60 ~400 ms
+        self._reverb_pd    = np.zeros(960, dtype=np.float32)  # 20 ms pre-delay @ 48 kHz
+        self._reverb_pd_h  = 0
         self._ap_delays    = [223, 341]
         self._ap_bufs      = [np.zeros(d, dtype=np.float32) for d in self._ap_delays]
         self._ap_heads     = [0] * 2
@@ -1915,6 +1934,11 @@ class VCProcessor:
             gate    = float(eff.get("gate", 0.0))
             clean   = max(denoise, gate)
             spec    = clean > 1e-3 and len(f) == VC_FRAME   # spectral gates need exact 10 ms hops
+
+            # ══════════ INPUT HPF — kill sub-bass that wastes WebRTC mixer headroom ══════════
+            if SCIPY_OK:
+                f, self.hpf_zi1 = lfilter(self.hpf_b, self.hpf_a, f, zi=self.hpf_zi1)
+                f, self.hpf_zi2 = lfilter(self.hpf_b, self.hpf_a, f, zi=self.hpf_zi2)
 
             # ══════════ STAGE 1 — VOICE ISOLATION (spectral): only voice through ══════════
             # Per-frequency spectral gate + voice band-limit: strips broadband noise and
@@ -1951,6 +1975,10 @@ class VCProcessor:
             if abs(pitch) > 1e-3:
                 f = self.pitch.process(f, 2.0 ** (pitch / 12.0))
 
+            # ══════════ MUD CUT — -3 dB @ 320 Hz clears boxy low-mid, frees presence ══════════
+            if SCIPY_OK:
+                f, self.mud_zi = lfilter(self.mud_b, self.mud_a, f, zi=self.mud_zi)
+
             # ══════════ STAGE 2 — SHAPE: deep body + presence + crisp air ══════════
             if SCIPY_OK:
                 bass = float(eff.get("bass", 0.0))
@@ -1979,26 +2007,40 @@ class VCProcessor:
                 self.rm_phase = (self.rm_phase + len(f)) % SR
                 f = f * (1.0 - robo) + (f * carrier) * robo
 
-            # ══════════ STAGE 3 — BOOST: multiband density + saturation (radio loud) ══════════
+            # ══════════ STAGE 3 — BOOST: real compressor + multiband density + saturation ══════════
             comp = float(eff.get("compress", 0.0))
             if comp > 1e-3:
-                p = 1.0 - 0.6 * comp
-                f = np.sign(f) * (np.abs(f) ** p)
-            # CRUSH — 3-band multiband compressor: crushes low/mid/high dynamics
-            # independently (the "dual/multi-band radio" density) then recombines.
+                # Real envelope compressor: attack 5ms, release 80ms, threshold -18dBFS, ratio 3:1
+                # memoryless power-law treated noise same as voice — this doesn't
+                thresh = 0.126 * (1.0 - comp * 0.7)
+                ratio  = 1.0 + comp * 2.0
+                atk    = 1.0 - np.exp(-VC_FRAME / (0.005 * SR))
+                rel    = 1.0 - np.exp(-VC_FRAME / (0.080 * SR))
+                fpeak  = float(np.max(np.abs(f)))
+                if fpeak > self.comp_env:
+                    self.comp_env += (fpeak - self.comp_env) * atk
+                else:
+                    self.comp_env += (fpeak - self.comp_env) * rel
+                if self.comp_env > thresh:
+                    over_db  = 20.0 * np.log10(self.comp_env / (thresh + 1e-9))
+                    gain_db  = -over_db * (1.0 - 1.0 / ratio)
+                    f = f * float(10.0 ** (gain_db / 20.0))
+            # CRUSH — 3-band multiband compressor with LR4 crossovers (no notch at Xover)
             crush = float(eff.get("crush", 0.0))
             if crush > 1e-3 and SCIPY_OK:
-                lo, self.mb_lo_zi = lfilter(self.mb_lp_b, self.mb_lp_a, f, zi=self.mb_lo_zi)
-                hi, self.mb_hi_zi = lfilter(self.mb_hp_b, self.mb_hp_a, f, zi=self.mb_hi_zi)
+                lo, self.mb_lp_zi1 = lfilter(self.mb_lp_b, self.mb_lp_a, f,  zi=self.mb_lp_zi1)
+                lo, self.mb_lp_zi2 = lfilter(self.mb_lp_b, self.mb_lp_a, lo, zi=self.mb_lp_zi2)
+                hi, self.mb_hi_zi1 = lfilter(self.mb_hp_b, self.mb_hp_a, f,  zi=self.mb_hi_zi1)
+                hi, self.mb_hi_zi2 = lfilter(self.mb_hp_b, self.mb_hp_a, hi, zi=self.mb_hi_zi2)
                 mid = f - lo - hi
                 pe  = 1.0 - 0.6 * crush
                 lo  = np.sign(lo)  * (np.abs(lo)  ** pe)
                 mid = np.sign(mid) * (np.abs(mid) ** pe)
                 hi  = np.sign(hi)  * (np.abs(hi)  ** pe)
-                f = (lo * 0.85 + mid * 1.35 + hi * 1.25).astype(np.float32)
+                f = (lo * 0.90 + mid * 1.10 + hi * 1.05).astype(np.float32)
             g = float(eff.get("gain", 1.0))
             if abs(g - 1.0) > 1e-3:
-                f = np.tanh(f * g)   # odd harmonics = louder + brighter, no hard-clip
+                f = np.tanh(f * min(g, 4.0))   # cap drive at 4.0 — beyond that noise saturates same as voice
             # WARMTH — even-harmonic (tube-style) saturation: adds perceived thickness
             # and warmth without the harshness of odd-harmonic tanh.
             warmth = float(eff.get("warmth", 0.0))
@@ -2008,11 +2050,20 @@ class VCProcessor:
                 pk = float(np.max(np.abs(f)))
                 if pk > 1e-6:
                     f = f / pk * min(pk, 1.0)
-
-            # ══════════ STAGE 4 — RE-DENOISE (spectral): scrub the hiss/harshness the boost
-            # just lifted, so the loudness stays clean. This is the second denoise layer. ══════════
-            if spec:
-                f = self.sgate2.process_hop(f, min(1.0, clean * 0.85))
+            # SPEECH-LEVEL RIDER — holds voice at ~-18 dBFS before the limiter so the
+            # WebRTC mixer always sees a consistent level regardless of how loud the user speaks
+            _r_atk = 1.0 - np.exp(-VC_FRAME / (0.030 * SR))
+            _r_rel = 1.0 - np.exp(-VC_FRAME / (0.300 * SR))
+            frms   = float(np.sqrt(np.mean(f * f) + 1e-9))
+            _ra    = _r_atk if frms > self.rider_env else _r_rel
+            self.rider_env += (frms - self.rider_env) * _ra
+            if self.rider_env > 1e-5:
+                _rgt = float(np.clip(0.126 / self.rider_env,
+                                     10 ** (-4.0 / 20), 10 ** (4.0 / 20)))
+            else:
+                _rgt = 1.0
+            self.rider_g += (_rgt - self.rider_g) * 0.1
+            f = f * float(self.rider_g)
 
             # ══════════ STAGE 4.5 — ECHO / ROOM REVERB ══════════
             echo = float(eff.get("echo", 0.0))
@@ -2022,7 +2073,7 @@ class VCProcessor:
             # ══════════ STAGE 5 — LOOK-AHEAD BRICK-WALL LIMITER ══════════
             # Buffer 5 frames (50 ms) ahead: see the peak before it arrives, reduce gain
             # early so transients never eat the ceiling — RMS (average loudness) goes up.
-            ceil = 0.992
+            ceil = 0.94
             self._la_buf.append(f.copy())
             if len(self._la_buf) >= 5:
                 future_peak = max(float(np.max(np.abs(fr))) for fr in self._la_buf) if self._la_buf else 0.0
@@ -2073,21 +2124,28 @@ class VCProcessor:
         return f * (1.0 - 0.5 * depth) + delayed.astype(np.float32) * (0.5 * depth)
 
     def _reverb(self, f, amount):
-        """Schroeder reverb: 4 parallel comb filters → 2 series allpass.
-        Tuned to a tight broadcast-booth plate (~100 ms RT60). amount = 0..1 wet/dry."""
-        wet = np.zeros(len(f), dtype=np.float32)
-        fb   = 0.84
+        """Schroeder reverb: 20 ms pre-delay → 4 parallel comb filters (T60 ~400 ms) → 2 series allpass.
+        VAD-gated reverb send avoids muddy tail during silence. amount = 0..1 wet/dry."""
+        # 20 ms pre-delay ring buffer (960 samples @ 48 kHz)
+        pd_len = len(self._reverb_pd)
+        pd_out = np.empty(len(f), dtype=np.float32)
+        for i in range(len(f)):
+            pd_out[i] = self._reverb_pd[self._reverb_pd_h]
+            self._reverb_pd[self._reverb_pd_h] = f[i]
+            self._reverb_pd_h = (self._reverb_pd_h + 1) % pd_len
+        wet  = np.zeros(len(f), dtype=np.float32)
         damp = 0.20
         for i in range(4):
             buf = self._comb_bufs[i]
             d   = self._comb_delays[i]
             h   = self._comb_heads[i]
             ds  = self._comb_damp_s[i]
-            out = np.empty(len(f), dtype=np.float32)
-            for n in range(len(f)):
+            fb  = self._comb_fbs[i]
+            out = np.empty(len(pd_out), dtype=np.float32)
+            for n in range(len(pd_out)):
                 y   = buf[h]
                 ds  = y * damp + ds * (1.0 - damp)
-                buf[h] = f[n] + ds * fb
+                buf[h] = pd_out[n] + ds * fb
                 h   = (h + 1) % d
                 out[n] = y
             self._comb_heads[i]  = h
@@ -2108,6 +2166,8 @@ class VCProcessor:
                 h       = (h + 1) % d
             self._ap_heads[i] = h
             wet = out
+        # Gate the reverb send by VAD so silence gaps don't bloom with muddy tail
+        wet = wet * float(self.vad_g)
         return (f * (1.0 - amount * 0.6) + wet * (amount * 0.8)).astype(np.float32)
 
 

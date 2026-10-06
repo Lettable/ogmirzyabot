@@ -2883,7 +2883,7 @@ function VCDialog({ visible, onClose, onMinimize, selected, sessions, send, addL
                     <Button size="sm" className="h-7 px-2.5 text-[11px] font-semibold" onClick={() => setEffects({ gain: 14, bass: 2, treble: 2, pitch: 0, robotic: 0, thickness: 0, gate: 0, sharpen: 0.55, compress: 0.75, crush: 0.6, denoise: 0.88, echo: 0.35, warmth: 0.5 })}>
                       📻 Broadcast
                     </Button>
-                    <Button size="sm" className="h-7 px-2.5 text-[11px] font-semibold" onClick={() => setEffects({ gain: 18, bass: 8, treble: 1, pitch: -3, robotic: 0, thickness: 0.2, gate: 0, sharpen: 0.4, compress: 0.85, crush: 0.85, denoise: 0.82, echo: 0.25, warmth: 0.6 })}>
+                    <Button size="sm" className="h-7 px-2.5 text-[11px] font-semibold" onClick={() => setEffects({ gain: 18, bass: 2.5, treble: 1, pitch: -2, robotic: 0, thickness: 0.2, gate: 0, sharpen: 0.55, compress: 0.85, crush: 0.85, denoise: 0.82, echo: 0.25, warmth: 0.6 })}>
                       👁 God Voice
                     </Button>
                     {[
