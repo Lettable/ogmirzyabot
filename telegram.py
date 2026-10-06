@@ -1698,7 +1698,7 @@ VC_BUF_MAX    = 320    # ~3.2 s hard ceiling — must stay above PREBUF_MAX
 
 vcSenderThread  = None            # DEDICATED OS thread that paces output (see _vc_sender_thread)
 vcSenderStop    = None            # threading.Event to stop the sender thread
-_vcDspExecutor  = ThreadPoolExecutor(max_workers=2)   # DSP for concurrent users
+_vcDspExecutor  = ThreadPoolExecutor(max_workers=4)   # DSP workers — 2 was too few: with 4 FFTs+reverb per 10ms frame, 2 workers starved under any real load causing underruns → prebuf ratchet → stop
 
 
 def _shelf_coeffs(kind, gain_db, fc, sr=SR):
@@ -1770,9 +1770,11 @@ class _GranularPitch:
             self.ola = np.concatenate([self.ola[self.H:], np.zeros(self.H, dtype=np.float32)])
             self.anchor += self.H                    # analysis hop == synthesis hop → 1:1 length
             oi += self.H
-        # bound memory: drop fully-consumed input
+        # bound memory: drop fully-consumed input — use >= so trim fires at exactly 4*G,
+        # preventing a stale inbuf on the next call that causes the first grain to break
+        # immediately and return a full frame of silence (periodic 10 ms stutter).
         consumed = int(self.anchor)
-        if consumed > 4 * self.G:
+        if consumed >= 4 * self.G:
             self.inbuf  = self.inbuf[consumed:]
             self.anchor -= consumed
             idx_all = None
@@ -1840,7 +1842,9 @@ class SpectralGate:
         y = np.fft.irfft(X * (gain * self.band), n=n).astype(np.float32) * self.win
         self.ola += y
         out = self.ola[:hop].copy()
-        self.ola = np.concatenate([self.ola[hop:], np.zeros(hop, dtype=np.float32)])
+        # roll in-place instead of allocating a new array every hop (~200 allocs/sec eliminated)
+        self.ola[:n - hop] = self.ola[hop:]
+        self.ola[n - hop:] = 0.0
         return out
 
 
@@ -2484,7 +2488,7 @@ def _vc_sender_thread(loop, stop):
                 fq = vcUserFrames.get(user)
                 if fq is None:
                     continue
-                st = state.setdefault(user, {"playing": False, "prebuf": VC_PREBUF_MIN})
+                st = state.setdefault(user, {"playing": False, "prebuf": VC_PREBUF_MIN, "good_ticks": 0})
                 while len(fq) > VC_BUF_MAX:
                     try: fq.popleft()
                     except IndexError: break
@@ -2493,12 +2497,19 @@ def _vc_sender_thread(loop, stop):
                     frame = silence
                     if len(fq) >= st["prebuf"]:
                         st["playing"] = True
+                        st["good_ticks"] = 0
                 if st["playing"]:
                     try:
                         frame = fq.popleft()
+                        # prebuf ratchets UP on underrun, DOWN after sustained clean playback
+                        st["good_ticks"] = st["good_ticks"] + 1
+                        if st["good_ticks"] >= 100 and st["prebuf"] > VC_PREBUF_MIN:
+                            st["prebuf"] = max(VC_PREBUF_MIN, st["prebuf"] - 5)
+                            st["good_ticks"] = 0
                     except IndexError:
                         frame = silence
                         st["playing"] = False
+                        st["good_ticks"] = 0
                         st["prebuf"] = min(st["prebuf"] + 10, VC_PREBUF_MAX)
                 # send this user's frame ONLY to the accounts they own
                 for idx in idxs:
