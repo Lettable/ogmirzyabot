@@ -2009,7 +2009,7 @@ function VCDialog({ visible, onClose, onMinimize, selected, sessions, send, addL
   const [micMuted,  setMicMuted]  = useState(false)
   const [streaming, setStreaming] = useState(false)
   // Start with aggressive denoise + boost for crystal-clear, louder voice by default
-  const [effects, setEffects]     = useState({ gain: 6.0, bass: 0.0, treble: 0.0, pitch: 0.0, robotic: 0.0, thickness: 0.0, gate: 0.0, sharpen: 0.4, compress: 0.6, crush: 0.5, denoise: 0.85 })
+  const [effects, setEffects]     = useState({ gain: 6.0, bass: 0.0, treble: 0.0, pitch: 0.0, robotic: 0.0, thickness: 0.0, gate: 0.0, sharpen: 0.4, compress: 0.6, crush: 0.5, denoise: 0.85, echo: 0.0, warmth: 0.0 })
   const audioRef = useRef({ ctx: null, stream: null, node: null })
   // Media playback engine: a <video>/<audio> element OR a screen-share stream feeds
   // the SAME capture worklet → PCM frames → server → unmuted clients (so a file or
@@ -2854,16 +2854,37 @@ function VCDialog({ visible, onClose, onMinimize, selected, sessions, send, addL
                     onValueChange={([v]) => setEffects(p => ({ ...p, crush: v }))} className="flex-1" />
                   <span className="text-[10px] font-mono text-muted-foreground/60 w-8 text-right">{Math.round((effects.crush || 0) * 100)}%</span>
                 </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-[10px] text-primary/80 w-12 shrink-0" title="Room reverb — tight broadcast-booth plate echo, makes voice feel like a professional mic">Echo</span>
+                  <Slider min={0} max={1} step={0.05} value={[effects.echo || 0]}
+                    onValueChange={([v]) => setEffects(p => ({ ...p, echo: v }))} className="flex-1" />
+                  <span className="text-[10px] font-mono text-muted-foreground/60 w-8 text-right">{Math.round((effects.echo || 0) * 100)}%</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span className="text-[10px] text-primary/80 w-12 shrink-0" title="Tube warmth — even-harmonic saturation, makes voice thick and full without harshness">Warmth</span>
+                  <Slider min={0} max={1} step={0.05} value={[effects.warmth || 0]}
+                    onValueChange={([v]) => setEffects(p => ({ ...p, warmth: v }))} className="flex-1" />
+                  <span className="text-[10px] font-mono text-muted-foreground/60 w-8 text-right">{Math.round((effects.warmth || 0) * 100)}%</span>
+                </div>
 
                 {/* Voice presets */}
                 <div className="space-y-1.5 pt-1">
                   <p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">Voice Presets</p>
                   <div className="flex items-center gap-1.5 flex-wrap">
-                    <Button size="sm" className="h-7 px-2.5 text-[11px] font-semibold" onClick={() => setEffects({ gain: 12, bass: 2, treble: 3, pitch: 0, robotic: 0, thickness: 0, gate: 0, sharpen: 0.7, compress: 0.8, crush: 0.8, denoise: 0.88 })}>
+                    <Button size="sm" className="h-7 px-2.5 text-[11px] font-semibold" onClick={() => setEffects({ gain: 28, bass: 2, treble: 3, pitch: 0, robotic: 0, thickness: 0, gate: 0, sharpen: 0.7, compress: 0.8, crush: 0.8, denoise: 0.88, echo: 0.0, warmth: 0.3 })}>
                       🔥 Dominate
                     </Button>
-                    <Button size="sm" className="h-7 px-2.5 text-[11px] font-semibold" onClick={() => setEffects({ gain: 8, bass: 1, treble: 2, pitch: 0, robotic: 0, thickness: 0, gate: 0, sharpen: 0.5, compress: 0.65, crush: 0.55, denoise: 0.92 })}>
+                    <Button size="sm" className="h-7 px-2.5 text-[11px] font-semibold" onClick={() => setEffects({ gain: 8, bass: 1, treble: 2, pitch: 0, robotic: 0, thickness: 0, gate: 0, sharpen: 0.5, compress: 0.65, crush: 0.55, denoise: 0.92, echo: 0.0, warmth: 0.0 })}>
                       🎙 Crystal Clear
+                    </Button>
+                    <Button size="sm" className="h-7 px-2.5 text-[11px] font-semibold" onClick={() => setEffects({ gain: 38, bass: 3, treble: 4, pitch: 0, robotic: 0, thickness: 0.1, gate: 0, sharpen: 0.85, compress: 0.9, crush: 0.9, denoise: 0.90, echo: 0.0, warmth: 0.4 })}>
+                      💀 Obliterate
+                    </Button>
+                    <Button size="sm" className="h-7 px-2.5 text-[11px] font-semibold" onClick={() => setEffects({ gain: 14, bass: 2, treble: 2, pitch: 0, robotic: 0, thickness: 0, gate: 0, sharpen: 0.55, compress: 0.75, crush: 0.6, denoise: 0.88, echo: 0.35, warmth: 0.5 })}>
+                      📻 Broadcast
+                    </Button>
+                    <Button size="sm" className="h-7 px-2.5 text-[11px] font-semibold" onClick={() => setEffects({ gain: 18, bass: 8, treble: 1, pitch: -3, robotic: 0, thickness: 0.2, gate: 0, sharpen: 0.4, compress: 0.85, crush: 0.85, denoise: 0.82, echo: 0.25, warmth: 0.6 })}>
+                      👁 God Voice
                     </Button>
                     {[
                       { label: "Male",    e: { gain: 1.0, bass: 4,  treble: 0, pitch: -5, robotic: 0,    thickness: 0.25 } },
@@ -2876,7 +2897,7 @@ function VCDialog({ visible, onClose, onMinimize, selected, sessions, send, addL
                         {p.label}
                       </Button>
                     ))}
-                    <Button size="sm" variant="ghost" className="h-7 px-2.5 text-[11px] text-muted-foreground" onClick={() => setEffects({ gain: 1.0, bass: 0, treble: 0, pitch: 0, robotic: 0, thickness: 0, gate: 0, sharpen: 0, compress: 0, crush: 0, denoise: 0 })}>
+                    <Button size="sm" variant="ghost" className="h-7 px-2.5 text-[11px] text-muted-foreground" onClick={() => setEffects({ gain: 1.0, bass: 0, treble: 0, pitch: 0, robotic: 0, thickness: 0, gate: 0, sharpen: 0, compress: 0, crush: 0, denoise: 0, echo: 0, warmth: 0 })}>
                       Reset
                     </Button>
                   </div>

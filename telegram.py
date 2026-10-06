@@ -1680,7 +1680,7 @@ vcUserProcTask:  dict = {}   # username -> processor asyncio.Task
 DEFAULT_EFFECTS = {"gain": 1.0, "bass": 0.0, "treble": 0.0,
                    "pitch": 0.0, "robotic": 0.0, "thickness": 0.0,
                    "gate": 0.0, "sharpen": 0.0, "compress": 0.0, "crush": 0.0,
-                   "denoise": 0.0}
+                   "denoise": 0.0, "echo": 0.0, "warmth": 0.0}
 
 # ─── Audio pipeline (decoupled: receive → process → send), now PER USER ────────
 #   1. handleVCAudio       — enqueue the user's raw mic PCM into THEIR queue.
@@ -1879,6 +1879,18 @@ class VCProcessor:
         self._last_g     = 1.0     # gate gain actually applied last frame (for click-free ramp)
         self.gate_open   = True    # gate state-machine (hysteresis prevents chatter)
         self.gate_hold   = 0       # frames left to hold the gate open through a dip
+        # look-ahead limiter — 5-frame (50 ms) buffer for transient prediction
+        import collections as _col
+        self._la_buf    = _col.deque(maxlen=5)
+        self._la_lim_g  = 1.0
+        # Schroeder reverb (echo effect) — 4 comb + 2 allpass
+        self._comb_delays  = [1487, 1601, 1777, 1867]
+        self._comb_bufs    = [np.zeros(d, dtype=np.float32) for d in self._comb_delays]
+        self._comb_heads   = [0] * 4
+        self._comb_damp_s  = [0.0] * 4
+        self._ap_delays    = [223, 341]
+        self._ap_bufs      = [np.zeros(d, dtype=np.float32) for d in self._ap_delays]
+        self._ap_heads     = [0] * 2
 
     def feed(self, pcm_mono_bytes, eff):
         """Append incoming mono PCM, return list of processed STEREO int16 frames (20 ms each)."""
@@ -1979,25 +1991,50 @@ class VCProcessor:
                 lo  = np.sign(lo)  * (np.abs(lo)  ** pe)
                 mid = np.sign(mid) * (np.abs(mid) ** pe)
                 hi  = np.sign(hi)  * (np.abs(hi)  ** pe)
-                f = (lo * 0.95 + mid * 1.15 + hi * 1.2).astype(np.float32)
+                f = (lo * 0.85 + mid * 1.35 + hi * 1.25).astype(np.float32)
             g = float(eff.get("gain", 1.0))
             if abs(g - 1.0) > 1e-3:
-                f = np.tanh(f * g)   # saturator: odd harmonics = louder + brighter, no hard-clip
+                f = np.tanh(f * g)   # odd harmonics = louder + brighter, no hard-clip
+            # WARMTH — even-harmonic (tube-style) saturation: adds perceived thickness
+            # and warmth without the harshness of odd-harmonic tanh.
+            warmth = float(eff.get("warmth", 0.0))
+            if warmth > 1e-3:
+                f = f + warmth * 0.3 * (f * f)
+                f = f - np.mean(f)
+                pk = float(np.max(np.abs(f)))
+                if pk > 1e-6:
+                    f = f / pk * min(pk, 1.0)
 
             # ══════════ STAGE 4 — RE-DENOISE (spectral): scrub the hiss/harshness the boost
             # just lifted, so the loudness stays clean. This is the second denoise layer. ══════════
             if spec:
                 f = self.sgate2.process_hop(f, min(1.0, clean * 0.85))
 
-            # ══════════ STAGE 5 — BRICK-WALL LIMITER: loudness ceiling (broadcast-last) ══════════
-            ceil = 0.985
-            peak = float(np.max(np.abs(f))) if len(f) else 0.0
-            target = (ceil / peak) if peak > ceil else 1.0
-            if target < self.lim_g:
-                self.lim_g = target                                  # instant attack
+            # ══════════ STAGE 4.5 — ECHO / ROOM REVERB ══════════
+            echo = float(eff.get("echo", 0.0))
+            if echo > 1e-3:
+                f = self._reverb(f, echo)
+
+            # ══════════ STAGE 5 — LOOK-AHEAD BRICK-WALL LIMITER ══════════
+            # Buffer 5 frames (50 ms) ahead: see the peak before it arrives, reduce gain
+            # early so transients never eat the ceiling — RMS (average loudness) goes up.
+            ceil = 0.992
+            self._la_buf.append(f.copy())
+            if len(self._la_buf) >= 5:
+                future_peak = max(float(np.max(np.abs(fr))) for fr in self._la_buf) if self._la_buf else 0.0
+                f_out = self._la_buf[0]
+                target = (ceil / future_peak) if future_peak > ceil else 1.0
+                if target < self._la_lim_g:
+                    self._la_lim_g = target
+                else:
+                    self._la_lim_g += (target - self._la_lim_g) * 0.35
+                f = f_out * self._la_lim_g
             else:
-                self.lim_g += (target - self.lim_g) * 0.2            # smooth release
-            f = f * self.lim_g
+                peak = float(np.max(np.abs(f))) if len(f) else 0.0
+                target = (ceil / peak) if peak > ceil else 1.0
+                if target < self.lim_g: self.lim_g = target
+                else: self.lim_g += (target - self.lim_g) * 0.35
+                f = f * self.lim_g
 
             # ══════════ FINAL GATE — mute the boosted gaps, ramped (no clicks/chopping) ══════════
             g1 = float(self.vad_g)
@@ -2030,6 +2067,44 @@ class VCProcessor:
         self.ch_wi   = (self.ch_wi + n) % L
         self.ch_phase = (self.ch_phase + n / SR * 2 * np.pi * 0.6) % (2 * np.pi)
         return f * (1.0 - 0.5 * depth) + delayed.astype(np.float32) * (0.5 * depth)
+
+    def _reverb(self, f, amount):
+        """Schroeder reverb: 4 parallel comb filters → 2 series allpass.
+        Tuned to a tight broadcast-booth plate (~100 ms RT60). amount = 0..1 wet/dry."""
+        wet = np.zeros(len(f), dtype=np.float32)
+        fb   = 0.84
+        damp = 0.20
+        for i in range(4):
+            buf = self._comb_bufs[i]
+            d   = self._comb_delays[i]
+            h   = self._comb_heads[i]
+            ds  = self._comb_damp_s[i]
+            out = np.empty(len(f), dtype=np.float32)
+            for n in range(len(f)):
+                y   = buf[h]
+                ds  = y * damp + ds * (1.0 - damp)
+                buf[h] = f[n] + ds * fb
+                h   = (h + 1) % d
+                out[n] = y
+            self._comb_heads[i]  = h
+            self._comb_damp_s[i] = ds
+            wet += out
+        wet *= 0.25
+        ag = 0.5
+        for i in range(2):
+            buf = self._ap_bufs[i]
+            d   = self._ap_delays[i]
+            h   = self._ap_heads[i]
+            out = np.empty(len(wet), dtype=np.float32)
+            for n in range(len(wet)):
+                bh      = buf[h]
+                v       = wet[n] + ag * bh
+                buf[h]  = v
+                out[n]  = bh - ag * v
+                h       = (h + 1) % d
+            self._ap_heads[i] = h
+            wet = out
+        return (f * (1.0 - amount * 0.6) + wet * (amount * 0.8)).astype(np.float32)
 
 
 # ─── Per-user VC plumbing ──────────────────────────────────────────────────────
